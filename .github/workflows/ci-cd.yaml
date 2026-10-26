@@ -1,0 +1,154 @@
+name: CI/CD - Image Classification
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+# OIDC: GitHub proves its identity to AWS and receives short-lived credentials.
+# No AWS access keys are stored anywhere.
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  AWS_ROLE_ARN: arn:aws:iam::339712937483:role/github-actions-dvc-deploy
+  S3_BUCKET: dvc-image-classifier-339712937483
+  EC2_INSTANCE_ID: i-0f5430b06cc59d86a
+  APP_URL: http://3.111.51.109
+
+jobs:
+  # ---------------------------------------------------------------- CI
+  test:
+    name: Test (DVC pipeline + pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Reproduce DVC pipeline (prepare -> train -> evaluate)
+        run: dvc repro --force
+
+      - name: Show metrics
+        run: dvc metrics show
+
+      - name: Run tests (pipeline, model and web app)
+        run: python -m pytest test.py -v --junitxml=test-results.xml
+
+      - name: Configure AWS credentials (OIDC)
+        if: github.event_name == 'push'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Push data + model to DVC remote (S3) and publish release manifest
+        if: github.event_name == 'push'
+        run: |
+          dvc push
+          aws s3 cp dvc.lock s3://$S3_BUCKET/releases/$GITHUB_SHA/dvc.lock
+          aws s3 cp dvc.lock s3://$S3_BUCKET/releases/latest/dvc.lock
+          aws s3 ls --recursive s3://$S3_BUCKET/ --human-readable | tail -n 12
+
+      - name: Upload model bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-bundle
+          path: |
+            models/model.pkl
+            metrics.json
+            dvc.lock
+            test-results.xml
+
+  # ---------------------------------------------------------------- Docker
+  docker:
+    name: Docker build + container smoke test
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: model-bundle
+
+      - name: Build image
+        run: |
+          docker build -t image-classifier:${GITHUB_SHA::7} -t image-classifier:latest .
+          docker images image-classifier
+
+      - name: Run container and smoke-test endpoints
+        run: |
+          docker run -d --name ic -p 8080:5000 image-classifier:latest
+          for i in $(seq 1 15); do curl -fsS localhost:8080/health && break; sleep 2; done
+          echo
+          docker exec -i ic python - <<'EOF'
+          import base64, io, json, urllib.request
+          from sklearn.datasets import load_digits
+          from PIL import Image
+          import numpy as np
+          d = load_digits()
+          img = Image.fromarray((d.images[0] / 16 * 255).astype("uint8")).resize((280, 280), Image.NEAREST)
+          buf = io.BytesIO(); img.save(buf, "PNG")
+          body = json.dumps({"image": base64.b64encode(buf.getvalue()).decode()}).encode()
+          req = urllib.request.Request("http://localhost:5000/predict", body, {"Content-Type": "application/json"})
+          out = json.load(urllib.request.urlopen(req))
+          print("true label:", d.target[0], "| predicted:", out["prediction"], "| confidence:", out["confidence"])
+          assert out["prediction"] == d.target[0]
+          EOF
+          docker logs ic | tail -5
+
+  # ---------------------------------------------------------------- CD
+  deploy:
+    name: Deploy to AWS EC2
+    needs: [test, docker]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ env.APP_URL }}
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy on EC2 via SSM (git checkout -> dvc pull from S3 -> docker build -> docker run)
+        run: |
+          CMD_ID=$(aws ssm send-command \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "deploy ${GITHUB_SHA::7}" \
+            --parameters "commands=[\"test -d /opt/image-classifier/.git || git clone -q https://github.com/${GITHUB_REPOSITORY}.git /opt/image-classifier\",\"cd /opt/image-classifier && git fetch -q origin && git checkout -qf $GITHUB_SHA && bash deploy/deploy.sh $GITHUB_SHA\"]" \
+            --timeout-seconds 900 \
+            --query Command.CommandId --output text)
+          echo "SSM command: $CMD_ID"
+          for i in $(seq 1 90); do
+            STATUS=$(aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$EC2_INSTANCE_ID" \
+                       --query Status --output text 2>/dev/null || echo Pending)
+            echo "[$i] $STATUS"
+            case "$STATUS" in Success|Failed|Cancelled|TimedOut) break;; esac
+            sleep 10
+          done
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$EC2_INSTANCE_ID" \
+            --query StandardOutputContent --output text
+          aws ssm get-command-invocation --command-id "$CMD_ID" --instance-id "$EC2_INSTANCE_ID" \
+            --query StandardErrorContent --output text | tail -n 20
+          test "$STATUS" = Success
+
+      - name: Verify public endpoint
+        run: |
+          for i in $(seq 1 10); do curl -fsS "$APP_URL/health" && break; sleep 5; done
+          echo
+          curl -fsS -o /dev/null -w "GET / -> HTTP %{http_code}\n" "$APP_URL/"
