@@ -1,2 +1,6 @@
 [core]
     autostage = true
+    remote = storage
+['remote "storage"']
+    url = s3://dvc-image-classifier-339712937483/dvcstore
+    region = ap-south-1
