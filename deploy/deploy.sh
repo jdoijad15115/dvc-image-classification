@@ -9,6 +9,18 @@ export HOME=${HOME:-/root}   # SSM runs commands without HOME; git and dvc need 
 APP_DIR=/opt/image-classifier
 REPO_URL=${REPO_URL:-https://github.com/jdoijad15115/dvc-image-classification.git}
 SHA=${1:-main}
+VENV=/opt/dvc-venv
+DVC=$VENV/bin/dvc
+
+echo "==> [0/4] prerequisites"
+# DVC lives in its own virtualenv: a system-wide `pip install dvc` upgrades shared
+# Python packages and breaks the OS-packaged AWS CLI (No module named 'dateutil').
+if [ ! -x "$DVC" ]; then
+  python3 -m venv "$VENV"
+  "$VENV/bin/pip" install -q --upgrade pip
+  "$VENV/bin/pip" install -q "dvc[s3]"
+fi
+"$DVC" --version
 
 echo "==> [1/4] sync code to $SHA"
 if [ ! -d "$APP_DIR/.git" ]; then
@@ -20,9 +32,24 @@ git checkout --quiet --force "$SHA"
 BUCKET=$(grep -oP "url = s3://\K[^/]+" .dvc/config)
 
 echo "==> [2/4] pull model from DVC remote s3://$BUCKET"
-aws s3 cp "s3://$BUCKET/releases/$SHA/dvc.lock" dvc.lock --only-show-errors \
-  || aws s3 cp "s3://$BUCKET/releases/latest/dvc.lock" dvc.lock --only-show-errors
-dvc pull models/model.pkl
+# Release manifest = the dvc.lock CI produced for this commit, so EC2 pulls exactly the
+# model that CI tested. Fetched with botocore from the DVC venv (uses the instance role).
+"$VENV/bin/python" - "$BUCKET" "$SHA" <<'PY'
+import sys, botocore.session
+bucket, sha = sys.argv[1], sys.argv[2]
+s3 = botocore.session.get_session().create_client("s3", region_name="ap-south-1")
+for key in (f"releases/{sha}/dvc.lock", "releases/latest/dvc.lock"):
+    try:
+        body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+    except s3.exceptions.NoSuchKey:
+        continue
+    open("dvc.lock", "wb").write(body)
+    print(f"release manifest: s3://{bucket}/{key}")
+    break
+else:
+    sys.exit("no release manifest found in S3")
+PY
+"$DVC" pull models/model.pkl
 test -s models/model.pkl
 
 echo "==> [3/4] docker build"
