@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Digit Classifier · DVC + Docker + AWS</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --line:#2a2f3a; --text:#e7e9ee; --muted:#9097a3; --accent:#4f9dff; --good:#3ecf8e; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  header { padding:22px 24px 8px; max-width:980px; margin:auto; }
+  h1 { margin:0; font-size:22px; letter-spacing:-.01em; }
+  .sub { color:var(--muted); margin-top:4px; }
+  .chips { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
+  .chip { border:1px solid var(--line); border-radius:999px; padding:3px 10px; font-size:12.5px; color:var(--muted); }
+  .chip b { color:var(--text); font-weight:600; }
+  main { max-width:980px; margin:auto; padding:16px 24px 40px; display:grid; grid-template-columns:1fr 1fr; gap:18px; }
+  @media (max-width:760px){ main { grid-template-columns:1fr; } }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:18px; }
+  .card h2 { margin:0 0 12px; font-size:14px; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); font-weight:600; }
+  canvas#pad { width:100%; aspect-ratio:1; background:#000; border-radius:8px; touch-action:none; cursor:crosshair; display:block; }
+  .row { display:flex; gap:10px; margin-top:12px; flex-wrap:wrap; }
+  button, label.btn { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:9px 16px; font-weight:600; cursor:pointer; font-size:14px; }
+  button.ghost, label.btn { background:transparent; border:1px solid var(--line); color:var(--text); }
+  input[type=file] { display:none; }
+  .big { font-size:84px; font-weight:700; line-height:1; color:var(--good); font-variant-numeric:tabular-nums; }
+  .conf { color:var(--muted); margin-top:6px; }
+  .bars { margin-top:16px; display:grid; gap:6px; }
+  .bar { display:grid; grid-template-columns:18px 1fr 52px; gap:8px; align-items:center; font-variant-numeric:tabular-nums; font-size:13px; }
+  .track { height:8px; background:#0b0d11; border-radius:4px; overflow:hidden; }
+  .fill { height:100%; background:var(--accent); width:0; transition:width .25s; }
+  .grid8 { display:grid; grid-template-columns:repeat(8,1fr); gap:2px; width:120px; margin-top:16px; }
+  .grid8 div { aspect-ratio:1; border-radius:2px; }
+  .muted { color:var(--muted); font-size:13px; }
+  footer { max-width:980px; margin:auto; padding:0 24px 30px; color:var(--muted); font-size:12.5px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Handwritten Digit Classifier</h1>
+  <div class="sub">MLP image classifier trained with a DVC pipeline, served from a Docker container on AWS EC2.</div>
+  <div class="chips">
+    <span class="chip">test accuracy <b>{{ "%.2f"|format((metrics.accuracy or 0)*100) }}%</b></span>
+    <span class="chip">macro F1 <b>{{ metrics.f1_macro or "–" }}</b></span>
+    <span class="chip">input <b>8×8 grayscale</b></span>
+    <span class="chip">model storage <b>DVC → S3</b></span>
+  </div>
+</header>
+<main>
+  <section class="card">
+    <h2>Draw a digit (0–9)</h2>
+    <canvas id="pad" width="280" height="280"></canvas>
+    <div class="row">
+      <button id="predict">Predict</button>
+      <button class="ghost" id="clear">Clear</button>
+      <label class="btn">Upload image<input type="file" id="file" accept="image/*"></label>
+    </div>
+    <p class="muted">Draw large and centred. Uploads work best with one dark digit on a light background.</p>
+  </section>
+  <section class="card">
+    <h2>Prediction</h2>
+    <div id="empty" class="muted">Draw a digit and press Predict.</div>
+    <div id="out" hidden>
+      <div class="big" id="digit">–</div>
+      <div class="conf" id="conf"></div>
+      <div class="bars" id="bars"></div>
+      <div class="muted" style="margin-top:14px">What the model sees (8×8):</div>
+      <div class="grid8" id="g8"></div>
+    </div>
+  </section>
+</main>
+<footer>DVC pipeline · GitHub Actions CI/CD · Docker · AWS S3 + EC2 &nbsp;|&nbsp; <a href="/health" style="color:inherit">/health</a></footer>
+<script>
+const pad = document.getElementById('pad'), ctx = pad.getContext('2d');
+function reset(){ ctx.fillStyle='#000'; ctx.fillRect(0,0,pad.width,pad.height); }
+reset();
+ctx.lineWidth = 22; ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.strokeStyle = '#fff';
+let drawing = false;
+function pos(e){ const r = pad.getBoundingClientRect(); const t = e.touches ? e.touches[0] : e;
+  return [(t.clientX - r.left) * pad.width / r.width, (t.clientY - r.top) * pad.height / r.height]; }
+function start(e){ drawing = true; const [x,y] = pos(e); ctx.beginPath(); ctx.moveTo(x,y); e.preventDefault(); }
+function move(e){ if(!drawing) return; const [x,y] = pos(e); ctx.lineTo(x,y); ctx.stroke(); e.preventDefault(); }
+function end(){ drawing = false; }
+pad.addEventListener('mousedown', start); pad.addEventListener('mousemove', move); window.addEventListener('mouseup', end);
+pad.addEventListener('touchstart', start, {passive:false}); pad.addEventListener('touchmove', move, {passive:false}); pad.addEventListener('touchend', end);
+document.getElementById('clear').onclick = () => { reset(); document.getElementById('out').hidden = true; document.getElementById('empty').hidden = false; };
+
+async function send(body, isForm){
+  const res = await fetch('/predict', isForm ? {method:'POST', body} :
+    {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const d = await res.json();
+  if (!res.ok) { alertBox(d.error || 'Prediction failed'); return; }
+  show(d);
+}
+function alertBox(msg){ document.getElementById('empty').hidden = false; document.getElementById('empty').textContent = msg; document.getElementById('out').hidden = true; }
+function show(d){
+  document.getElementById('empty').hidden = true; document.getElementById('out').hidden = false;
+  document.getElementById('digit').textContent = d.prediction;
+  document.getElementById('conf').textContent = 'confidence ' + (d.confidence*100).toFixed(1) + '%';
+  document.getElementById('bars').innerHTML = d.top3.map(t =>
+    `<div class="bar"><span>${t.digit}</span><div class="track"><div class="fill" style="width:${(t.p*100).toFixed(1)}%"></div></div><span>${(t.p*100).toFixed(1)}%</span></div>`).join('');
+  document.getElementById('g8').innerHTML = d.pixels.flat().map(v =>
+    `<div style="background:rgb(${Math.round(v*255)},${Math.round(v*255)},${Math.round(v*255)})"></div>`).join('');
+}
+document.getElementById('predict').onclick = () => send({image: pad.toDataURL('image/png')});
+document.getElementById('file').onchange = e => { if (!e.target.files[0]) return; const f = new FormData(); f.append('file', e.target.files[0]); send(f, true); e.target.value=''; };
+</script>
+</body>
+</html>
