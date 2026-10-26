@@ -1,0 +1,10 @@
+.git
+.dvc/cache
+.dvc/tmp
+data
+logs
+screenshots
+report
+__pycache__
+.pytest_cache
+*.zip

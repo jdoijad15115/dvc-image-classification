@@ -129,3 +129,49 @@ def test_accuracy_quality_gate():
     assert m["accuracy"] >= MIN_ACCURACY, (
         f"accuracy {m['accuracy']} below gate {MIN_ACCURACY}"
     )
+
+
+# ---------- web application (Flask) ----------
+@pytest.fixture(scope="module")
+def client():
+    import sys
+    sys.path.insert(0, "app")
+    import app as webapp
+    return webapp.app.test_client()
+
+
+def _png_b64(arr8, invert=False):
+    import base64, io
+    from PIL import Image
+    img = Image.fromarray((arr8 * 255).astype("uint8")).resize((280, 280), Image.NEAREST)
+    if invert:
+        img = Image.fromarray(255 - np.asarray(img))
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def test_app_health(client):
+    r = client.get("/health")
+    assert r.status_code == 200 and r.json["status"] == "ok"
+
+
+def test_app_index_page(client):
+    r = client.get("/")
+    assert r.status_code == 200 and b"Digit Classifier" in r.data
+
+
+def test_app_rejects_bad_image(client):
+    assert client.post("/predict", json={"image": "not-an-image"}).status_code == 400
+
+
+def test_app_predicts_real_images(client, test_data):
+    """Upscaled real test images (half inverted) sent through the HTTP API."""
+    n, ok = 100, 0
+    for i in range(n):
+        r = client.post("/predict", json={"image": _png_b64(test_data["X"][i].reshape(8, 8), invert=i % 2 == 1)})
+        assert r.status_code == 200
+        body = r.json
+        assert 0.0 <= body["confidence"] <= 1.0 and len(body["top3"]) == 3
+        ok += body["prediction"] == int(test_data["y"][i])
+    assert ok / n >= 0.85, f"API accuracy {ok}/{n}"

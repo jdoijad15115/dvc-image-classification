@@ -130,3 +130,8 @@ git push -u origin master
 git push origin --all          # optional: also push experiment refs: dvc exp push origin --all
 ```
 Open the repo's **Actions** tab, where the run "CI - Image Classification Tests" starts automatically on the push.
+
+
+
+## Actual CI run
+Repo: `jdoijad15115/dvc-image-classification` (private), branch `main`. Run #1 (commit `5c21f2c`) finished with **Success in 55s**: all 8 steps green, `dvc repro` reproduced accuracy 0.9844 on the GitHub runner, and pytest reported **12 passed**. Screenshots are in `screenshots/ci_github/`.
